@@ -73,11 +73,11 @@ class ConvexMpc():
         B = np.block([row[1],row[2],row[3],row[4]])
         return B
     
-    def calculate_qp_mat(self,euler):
+    def calculate_qp_mat(self, euler):
         """calculate A_qp and B_qp
         standard QP formulation:
-        minimize 1/2 * xT * H * x + q' * x subject to lb <= C * x <= ub
-        H: hessian
+        minimize 1/2 * xT * P * x + qT * x subject to lb <= C * x <= ub
+        P: hessian
         q: gradient
         C: linear constraints
         
@@ -116,7 +116,58 @@ class ConvexMpc():
                 else:
                     B_qp[i*3:i*3+3,j*3:j*3+3] = mat
         B_qp = np.array([])
-        return A_qp, B_qp, H, C
-            
+        return A_qp, B_qp, P, C
+    
+    # TODO: translate funtion under for isaac gym
+
+    def compute_contact_force(self,
+                            desired_acc,
+                            contacts,
+                            acc_weight=ACC_WEIGHT,
+                            reg_weight=1e-4,
+                            friction_coef=0.45,
+                            f_min_ratio=0.1,
+                            f_max_ratio=10.):
+        mass_matrix = compute_mass_matrix(
+            robot.MPC_BODY_MASS,
+            np.array(robot.MPC_BODY_INERTIA).reshape((3, 3)),
+            robot.GetFootPositionsInBaseFrame())
+        G, a = compute_objective_matrix(mass_matrix, desired_acc, acc_weight,
+                                        reg_weight)
+        C, b = compute_constraint_matrix(robot.MPC_BODY_MASS, contacts,
+                                        friction_coef, f_min_ratio, f_max_ratio)
+        G += 1e-4 * np.eye(12)
+        result = quadprog.solve_qp(G, a, C, b)
+        return -result[0].reshape((4, 3))
+
+    def compute_constraint_matrix(mpc_body_mass,
+                            contacts,
+                            friction_coef=0.8,
+                            f_min_ratio=0.1,
+                            f_max_ratio=10):
+        f_min = f_min_ratio * mpc_body_mass * 9.8
+        f_max = f_max_ratio * mpc_body_mass * 9.8
+        A = np.zeros((24, 12))
+        lb = np.zeros(24)
+        for leg_id in range(4):
+            A[leg_id * 2, leg_id * 3 + 2] = 1
+            A[leg_id * 2 + 1, leg_id * 3 + 2] = -1
+            if contacts[leg_id]:
+            lb[leg_id * 2], lb[leg_id * 2 + 1] = f_min, -f_max
+            else:
+            lb[leg_id * 2] = -1e-7
+            lb[leg_id * 2 + 1] = -1e-7
+
+        # Friction constraints
+        for leg_id in range(4):
+            row_id = 8 + leg_id * 4
+            col_id = leg_id * 3
+            lb[row_id:row_id + 4] = np.array([0, 0, 0, 0])
+            A[row_id, col_id:col_id + 3] = np.array([1, 0, friction_coef])
+            A[row_id + 1, col_id:col_id + 3] = np.array([-1, 0, friction_coef])
+            A[row_id + 2, col_id:col_id + 3] = np.array([0, 1, friction_coef])
+            A[row_id + 3, col_id:col_id + 3] = np.array([0, -1, friction_coef])
+        return A.T, lb
+                
             
     
