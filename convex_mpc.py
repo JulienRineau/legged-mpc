@@ -1,6 +1,10 @@
 import numpy as np
 import utils
 from params import *
+import osqp
+import numpy as np
+import scipy as sp
+from scipy import sparse
 
 class ConvexMpc():
     def __init__(self):
@@ -11,21 +15,17 @@ class ConvexMpc():
 
         Args:
             euler (_type_): _description_
-
-        Returns:
-            _type_: _description_
         """
         cos_yaw = np.cos(euler[2])
         sin_yaw = np.sin(euler[2])
         cos_pitch = np.cos(euler[1])
         tan_pitch = np.tan(euler[1])
                 
-        Rz = np.array([
+        self.Rz = np.array([
             [cos_yaw / cos_pitch, sin_yaw / cos_pitch, 0],
             [-sin_yaw, cos_yaw, 0],
             [cos_yaw * tan_pitch, sin_yaw * tan_pitch, 1]
         ]) #Transpose of Rz
-        return Rz
         
     def calculate_A_mat(self, Rz):
         """_summary_
@@ -39,13 +39,12 @@ class ConvexMpc():
         O3 = np.zeros((3,3))
         I3 = np.eye(3)
         
-        A = np.block([
+        self.A_mat = np.block([
             [O3,O3,Rz,O3],
             [O3,O3,O3,I3],
             [O3,O3,O3,O3],
             [O3,O3,O3,O3]
         ])
-        return A
         
     def calculate_B_mat(self, robot_mass, trunk_inertia, Rz,leg_pose):
         """_summary_
@@ -70,8 +69,7 @@ class ConvexMpc():
                 [np.linalg.inv(I)@utils.skew(leg_pose[i])],
                 [I3/robot_mass]
             ]))
-        B = np.block([row[1],row[2],row[3],row[4]])
-        return B
+        self.B_mat = np.block([row[1],row[2],row[3],row[4]])
     
     def calculate_qp_mat(self, euler):
         """calculate A_qp and B_qp
@@ -119,6 +117,80 @@ class ConvexMpc():
         return A_qp, B_qp, P, C
     
     # TODO: translate funtion under for isaac gym
+    
+    def osqp_solve(self, x_current, x_ref):
+        # Discrete time model of a quadcopter
+        Ad = sparse.csc_matrix(calculate_A_mat(self.Rz))
+        Bd = sparse.csc_matrix(calculate_B_mat(ROBOT_MASS, self.trunk_inertia, self.Rz, leg_pose))
+        [nx, nu] = Bd.shape
+
+        # Constraints
+        u0 = 10.5916
+        umin = np.array([9.6, 9.6, 9.6, 9.6]) - u0
+        umax = np.array([13., 13., 13., 13.]) - u0
+        xmin = np.array([-np.pi/6,-np.pi/6,-np.inf,-np.inf,-np.inf,-1.,
+                        -np.inf,-np.inf,-np.inf,-np.inf,-np.inf,-np.inf])
+        xmax = np.array([ np.pi/6, np.pi/6, np.inf, np.inf, np.inf, np.inf,
+                        np.inf, np.inf, np.inf, np.inf, np.inf, np.inf])
+
+        # Objective function
+        Q = sparse.diags([0., 0., 10., 10., 10., 10., 0., 0., 0., 5., 5., 5.])
+        QN = Q
+        R = 0.1*sparse.eye(4)
+
+        # Initial and reference states
+        x0 = x_current #np.array 1x12
+        xr = x_ref
+
+        # Prediction horizon
+        N = PLAN_HORIZON
+
+        # Cast MPC problem to a QP: x = (x(0),x(1),...,x(N),u(0),...,u(N-1))
+        # - quadratic objective
+        P = sparse.block_diag([sparse.kron(sparse.eye(N), Q), QN,
+                            sparse.kron(sparse.eye(N), R)], format='csc')
+        # - linear objective
+        q = np.hstack([np.kron(np.ones(N), -Q.dot(xr)), -QN.dot(xr),
+                    np.zeros(N*nu)])
+        # - linear dynamics
+        Ax = sparse.kron(sparse.eye(N+1),-sparse.eye(nx)) + sparse.kron(sparse.eye(N+1, k=-1), Ad)
+        Bu = sparse.kron(sparse.vstack([sparse.csc_matrix((1, N)), sparse.eye(N)]), Bd)
+        Aeq = sparse.hstack([Ax, Bu])
+        leq = np.hstack([-x0, np.zeros(N*nx)])
+        ueq = leq
+        # - input and state constraints
+        Aineq = sparse.eye((N+1)*nx + N*nu)
+        lineq = np.hstack([np.kron(np.ones(N+1), xmin), np.kron(np.ones(N), umin)])
+        uineq = np.hstack([np.kron(np.ones(N+1), xmax), np.kron(np.ones(N), umax)])
+        # - OSQP constraints
+        A = sparse.vstack([Aeq, Aineq], format='csc')
+        l = np.hstack([leq, lineq])
+        u = np.hstack([ueq, uineq])
+
+        # Create an OSQP object
+        prob = osqp.OSQP()
+
+        # Setup workspace
+        prob.setup(P, q, A, l, u, warm_start=True)
+
+        # Simulate in closed loop
+        nsim = 15
+        for i in range(nsim):
+            # Solve
+            res = prob.solve()
+
+            # Check solver status
+            if res.info.status != 'solved':
+                raise ValueError('OSQP did not solve the problem!')
+
+            # Apply first control input to the plant
+            ctrl = res.x[-N*nu:-(N-1)*nu]
+            x0 = Ad.dot(x0) + Bd.dot(ctrl)
+
+            # Update initial state
+            l[:nx] = -x0
+            u[:nx] = -x0
+            prob.update(l=l, u=u)
 
     def compute_contact_force(self,
                             desired_acc,

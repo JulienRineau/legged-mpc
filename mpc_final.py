@@ -7,7 +7,8 @@ from isaacgym import gymapi, gymutil, gymtorch
 from scipy.spatial.transform import Rotation as R
 import torch
 
-import util
+import utils
+import convex_mpc
 
 ASSET_ROOT = "../../../assets"
 ASSET_FILE = "urdf/a1_description/urdf/a1.urdf"
